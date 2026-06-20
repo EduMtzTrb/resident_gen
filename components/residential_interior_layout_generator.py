@@ -8,7 +8,7 @@
 #   apt_width  corridor_width  layout_type  seed  wall_thickness
 #
 # OUTPUTS to wire on the component:
-#   Interior_Breps   Space_Types   Apartment_Id   Floor_Index   Space_Colors
+#   Interior_Breps   Space_Types   Apartment_Id   Floor_Index   Space_Colors   Unit_Colors
 #   Corridor_Breps
 #   Wall_Breps       Wall_Colors            <-- NEW
 #   Door_Breps       Window_Breps           <-- NEW (indicative opening volumes)
@@ -69,6 +69,12 @@ WIN_W = 1.3
 WIN_H = 1.3
 WIN_SILL = 0.9
 
+# Minimum free span that can physically host a window (Hall uses this; others use WIN_W + 2t).
+MIN_WINDOW_SPAN = max(DOOR_W, wall_thickness * 4)
+# Minimum interior room dimension for non-Hall rooms.
+# Rooms below this size emit a warning but are still generated (no skip).
+MIN_ROOM_DIM = 2.6
+
 floors_in = [b for b in (Residential_Breps or []) if b and b.IsValid]
 cores_in = [b for b in (Core_Brep or []) if b and b.IsValid]
 
@@ -115,6 +121,114 @@ def overlap(b1, b2):
 core_bbs = [aabb(c) for c in cores_in]
 
 
+def _core_segment_overlap(wall_coord, wall_axis_is_x, seg_lo, seg_hi):
+    """Return blocked intervals where a core face lies on the wall plane
+    AND its face segment overlaps [seg_lo, seg_hi].
+
+    wall_axis_is_x=True  → wall at constant world-X = wall_coord; segment in world-Y.
+    wall_axis_is_x=False → wall at constant world-Y = wall_coord; segment in world-X.
+    """
+    blocked = []
+    for cb in core_bbs:
+        if wall_axis_is_x:
+            if not (abs(wall_coord - cb.Min.X) < EPS or abs(wall_coord - cb.Max.X) < EPS):
+                continue
+            core_lo, core_hi = cb.Min.Y, cb.Max.Y
+        else:
+            if not (abs(wall_coord - cb.Min.Y) < EPS or abs(wall_coord - cb.Max.Y) < EPS):
+                continue
+            core_lo, core_hi = cb.Min.X, cb.Max.X
+        ov_lo = max(seg_lo, core_lo)
+        ov_hi = min(seg_hi, core_hi)
+        if ov_hi - ov_lo > EPS:
+            blocked.append((ov_lo, ov_hi))
+    return blocked
+
+
+def _largest_free_segment(seg_lo, seg_hi, blocked):
+    """Largest contiguous free sub-interval of [seg_lo, seg_hi] after removing blocked."""
+    if not blocked:
+        return seg_lo, seg_hi
+    merged = []
+    for b in sorted(blocked):
+        b_lo = max(b[0], seg_lo)
+        b_hi = min(b[1], seg_hi)
+        if b_hi - b_lo <= EPS:
+            continue
+        if merged and b_lo <= merged[-1][1] + EPS:
+            merged[-1][1] = max(merged[-1][1], b_hi)
+        else:
+            merged.append([b_lo, b_hi])
+    best = (seg_lo, seg_lo)
+    cur = seg_lo
+    for b_lo, b_hi in merged:
+        if b_lo - cur > best[1] - best[0]:
+            best = (cur, b_lo)
+        cur = max(cur, b_hi)
+    if seg_hi - cur > best[1] - best[0]:
+        best = (cur, seg_hi)
+    return best
+
+
+def _faces_core_across_gap(wall_coord, wall_axis_is_x, outward_is_negative,
+                            seg_lo, seg_hi, max_gap):
+    """Return True when a wall faces a core across a gap in the outward direction.
+
+    wall_axis_is_x=True  → wall at constant world-X; outward along X; segment in world-Y.
+    wall_axis_is_x=False → wall at constant world-Y; outward along Y; segment in world-X.
+    outward_is_negative  → the outward normal points toward smaller coordinate values.
+    max_gap              → ignore cores beyond this distance from the wall.
+    """
+    for cb in core_bbs:
+        if wall_axis_is_x:
+            if outward_is_negative:
+                gap = wall_coord - cb.Max.X   # positive when core is fully outward
+            else:
+                gap = cb.Min.X - wall_coord
+            if gap < -EPS or gap > max_gap + EPS:
+                continue
+            span_ov = min(cb.Max.Y, seg_hi) - max(cb.Min.Y, seg_lo)
+        else:
+            if outward_is_negative:
+                gap = wall_coord - cb.Max.Y
+            else:
+                gap = cb.Min.Y - wall_coord
+            if gap < -EPS or gap > max_gap + EPS:
+                continue
+            span_ov = min(cb.Max.X, seg_hi) - max(cb.Min.X, seg_lo)
+        if span_ov > EPS:
+            return True
+    return False
+
+
+def _corridor_face_touches_core(ori, coord, span_lo, span_hi, z0, z1):
+    """Return True when a corridor exterior face is coplanar with a core face.
+
+    ori: 'y' → face at constant world-Y; span runs in world-X.
+         'x' → face at constant world-X; span runs in world-Y.
+    coord: the face's constant coordinate.
+    span_lo, span_hi: extent of the face in the perpendicular axis.
+    z0, z1: floor height range — cores outside this range are ignored.
+
+    When True, the caller must skip the exterior window (the door panel
+    created by emit_corridor_core_doors already covers this face).
+    """
+    for cb in core_bbs:
+        if cb.Max.Z < z0 - EPS or cb.Min.Z > z1 + EPS:
+            continue
+        if ori == 'y':
+            if not (abs(coord - cb.Min.Y) < EPS or abs(coord - cb.Max.Y) < EPS):
+                continue
+            ov = min(cb.Max.X, span_hi) - max(cb.Min.X, span_lo)
+        else:
+            if not (abs(coord - cb.Min.X) < EPS or abs(coord - cb.Max.X) < EPS):
+                continue
+            ov = min(cb.Max.Y, span_hi) - max(cb.Min.Y, span_lo)
+        if ov > EPS:
+            return True
+    return False
+
+
 def carve(cell):
     if cell is None:
         return []
@@ -132,26 +246,35 @@ def carve(cell):
     return [r for r in res if r and r.IsSolid]
 
 
-def win_geometry(lab, span, fh, z0):
+def win_geometry(lab, span, fh, z0, core_aligned=False):
     # Returns (win_w, w_zlo, w_zhi) for an exterior window, by space type.
     # span = usable wall width; fh = floor height; z0 = floor bottom Z.
-    # Hall:     90 % span × 90 % height, centred vertically and horizontally.
-    # Living:   80 % span × 80 % height, centred.
-    # Bedroom*: 80 % span, standard sill/head (WIN_SILL + WIN_H constants).
+    # core_aligned=True → Hall/Living use standard sill instead of tall centred opening.
+    # Hall:     90 % span × 70 % height centred (or WIN_H sill when core-aligned).
+    # Living:   80 % span × 70 % height centred (or WIN_H sill when core-aligned).
+    # Bedroom*: 60 % span, standard sill/head (WIN_SILL + WIN_H constants).
     # Bath:     50 % span, 35 % height, sill at 55 % of floor height.
     # Others (Kitchen…): fixed WIN_W, standard sill/head.
     # Corridor windows are handled by emit_corridor_ext_windows, not here.
     MIN_DIM = EPS * 10
     if lab == "Hall":
         win_w = span * 0.90
-        win_h = fh * 0.90
-        w_zlo = z0 + (fh - win_h) * 0.5
+        if core_aligned:
+            win_h = WIN_H          # fixed sill/head for core-adjacent walls
+            w_zlo = z0 + WIN_SILL
+        else:
+            win_h = fh * 0.70
+            w_zlo = z0 + (fh - win_h) * 0.5
     elif lab == "Living":
         win_w = span * 0.80
-        win_h = fh * 0.80
-        w_zlo = z0 + (fh - win_h) * 0.5
+        if core_aligned:
+            win_h = WIN_H          # fixed sill/head for core-adjacent walls
+            w_zlo = z0 + WIN_SILL
+        else:
+            win_h = fh * 0.70
+            w_zlo = z0 + (fh - win_h) * 0.5
     elif lab in ("Bedroom", "Bedroom1", "Bedroom2"):
-        win_w = span * 0.80
+        win_w = span * 0.60
         win_h = min(WIN_H, fh - 0.05 - min(WIN_SILL, 0.5 * fh))
         w_zlo = z0 + min(WIN_SILL, 0.5 * fh)
     elif lab == "Bath":
@@ -162,6 +285,9 @@ def win_geometry(lab, span, fh, z0):
         win_w = WIN_W
         win_h = min(WIN_H, fh - 0.05 - min(WIN_SILL, 0.5 * fh))
         w_zlo = z0 + min(WIN_SILL, 0.5 * fh)
+    # 85 % safety cap applied independently to width and height.
+    win_w = min(win_w, span * 0.85)
+    win_h = min(win_h, fh * 0.85)
     win_w = max(win_w, MIN_DIM)
     win_h = max(win_h, MIN_DIM)
     w_zhi = w_zlo + win_h
@@ -322,6 +448,22 @@ COL = {
 
 WALL_COL = sd.Color.FromArgb(120, 120, 128)
 
+# Muted apartment-unit palette; index = Apartment_Id % 10, deterministic.
+UNIT_ALPHA = 120
+UNIT_PALETTE = [
+    sd.Color.FromArgb(UNIT_ALPHA, 200, 130, 110),  # 0 terracotta
+    sd.Color.FromArgb(UNIT_ALPHA, 130, 175, 140),  # 1 sage
+    sd.Color.FromArgb(UNIT_ALPHA, 160, 145, 195),  # 2 lavender
+    sd.Color.FromArgb(UNIT_ALPHA, 210, 180, 100),  # 3 gold
+    sd.Color.FromArgb(UNIT_ALPHA, 110, 175, 175),  # 4 teal
+    sd.Color.FromArgb(UNIT_ALPHA, 200, 150, 155),  # 5 rose
+    sd.Color.FromArgb(UNIT_ALPHA, 130, 160, 195),  # 6 steel-blue
+    sd.Color.FromArgb(UNIT_ALPHA, 165, 175, 120),  # 7 olive
+    sd.Color.FromArgb(UNIT_ALPHA, 210, 155, 130),  # 8 coral
+    sd.Color.FromArgb(UNIT_ALPHA, 155, 155, 200),  # 9 periwinkle
+]
+UNIT_CORR_COL = sd.Color.FromArgb(175, 175, 178)
+
 
 def color(l):
     r, g, b = COL.get(l, (200, 200, 200))
@@ -337,6 +479,7 @@ Space_Types = []
 Apartment_Id = []
 Floor_Index = []
 Space_Colors = []
+Unit_Colors = []
 Corridor_Breps = []
 
 Wall_Breps = []
@@ -364,6 +507,9 @@ def emit(brep, label, aid, fi):
         Apartment_Id.append(aid)
         Floor_Index.append(fi)
         Space_Colors.append(color(label))
+        Unit_Colors.append(
+            UNIT_PALETTE[aid % len(UNIT_PALETTE)] if aid >= 0 else UNIT_CORR_COL
+        )
 
         bb_p = p.GetBoundingBox(True)
         cx = 0.5 * (bb_p.Min.X + bb_p.Max.X)
@@ -429,7 +575,7 @@ def emit_corridor_ext_windows(corr_brep, floor_bb, z0, z1):
         cx_c = 0.5 * (span0 + span1)
         vx0 = cx_c - 0.5 * win_w
         vx1 = cx_c + 0.5 * win_w
-        void = box_brep(vx0, vx1, py0 - wt, py1 + wt, w_zlo, w_zhi)
+        void = box_brep(vx0, vx1, py0 - wt - EPS, py1 + wt + EPS, w_zlo, w_zhi)
         if void:
             res = rg.Brep.CreateBooleanDifference([panel], [void], TOL)
             if res:
@@ -460,7 +606,7 @@ def emit_corridor_ext_windows(corr_brep, floor_bb, z0, z1):
         cy_c = 0.5 * (span0 + span1)
         vy0 = cy_c - 0.5 * win_w
         vy1 = cy_c + 0.5 * win_w
-        void = box_brep(px0 - wt, px1 + wt, vy0, vy1, w_zlo, w_zhi)
+        void = box_brep(px0 - wt - EPS, px1 + wt + EPS, vy0, vy1, w_zlo, w_zhi)
         if void:
             res = rg.Brep.CreateBooleanDifference([panel], [void], TOL)
             if res:
@@ -476,13 +622,100 @@ def emit_corridor_ext_windows(corr_brep, floor_bb, z0, z1):
             Window_Breps.append(pan)
 
     if abs(cy0 - floor_bb.Min.Y) <= EPS:   # south face
-        _y_wall(cx0, cx1, cy0, True)
+        if not _corridor_face_touches_core('y', cy0, cx0, cx1, z0, z1):
+            _y_wall(cx0, cx1, cy0, True)
     if abs(cy1 - floor_bb.Max.Y) <= EPS:   # north face
-        _y_wall(cx0, cx1, cy1, False)
+        if not _corridor_face_touches_core('y', cy1, cx0, cx1, z0, z1):
+            _y_wall(cx0, cx1, cy1, False)
     if abs(cx0 - floor_bb.Min.X) <= EPS:   # west face
-        _x_wall(cy0, cy1, cx0, True)
+        if not _corridor_face_touches_core('x', cx0, cy0, cy1, z0, z1):
+            _x_wall(cy0, cy1, cx0, True)
     if abs(cx1 - floor_bb.Max.X) <= EPS:   # east face
-        _x_wall(cy0, cy1, cx1, False)
+        if not _corridor_face_touches_core('x', cx1, cy0, cy1, z0, z1):
+            _x_wall(cy0, cy1, cx1, False)
+
+
+def _corr_core_door(ori, coord, inward, span_lo, span_hi, zlo, zhi, d_zhi):
+    """Wall panel with a centred door at a corridor/core shared face.
+    ori: 'x' (face at constant X) or 'y' (face at constant Y).
+    inward=True → corridor is north/east of core → panel at [coord, coord+t].
+    """
+    span = span_hi - span_lo
+    if span < EPS * 10:
+        return
+    t = wall_thickness
+    sc_mid = 0.5 * (span_lo + span_hi)
+    ww = min(DOOR_W, span * 0.80)
+    p0 = coord if inward else coord - t
+    p1 = p0 + t
+    if ori == 'y':
+        panel = box_brep(span_lo, span_hi, p0, p1, zlo, zhi)
+        void  = box_brep(sc_mid - 0.5*ww, sc_mid + 0.5*ww, p0 - t - EPS, p1 + t + EPS, zlo, d_zhi)
+        door_ind = box_brep(sc_mid - 0.5*ww, sc_mid + 0.5*ww,
+                            0.5*(p0+p1) - 0.25*t, 0.5*(p0+p1) + 0.25*t, zlo, d_zhi)
+    else:
+        panel = box_brep(p0, p1, span_lo, span_hi, zlo, zhi)
+        void  = box_brep(p0 - t - EPS, p1 + t + EPS, sc_mid - 0.5*ww, sc_mid + 0.5*ww, zlo, d_zhi)
+        door_ind = box_brep(0.5*(p0+p1) - 0.25*t, 0.5*(p0+p1) + 0.25*t,
+                            sc_mid - 0.5*ww, sc_mid + 0.5*ww, zlo, d_zhi)
+    if panel is None:
+        return
+    if void:
+        res = rg.Brep.CreateBooleanDifference([panel], [void], TOL)
+        if res:
+            for r in res:
+                if r and r.IsSolid:
+                    Wall_Breps.append(r)
+                    Wall_Colors.append(WALL_COL)
+        else:
+            if panel.IsSolid:
+                Wall_Breps.append(panel)
+                Wall_Colors.append(WALL_COL)
+    else:
+        if panel.IsSolid:
+            Wall_Breps.append(panel)
+            Wall_Colors.append(WALL_COL)
+    if door_ind:
+        Door_Breps.append(door_ind)
+
+
+def emit_corridor_core_doors(new_corr_breps, z0, z1):
+    """Emit one wall+door panel at each corridor/core shared face."""
+    if not compute_walls:
+        return
+    if not cores_in:
+        return
+    fh = z1 - z0
+    d_zhi = z0 + min(DOOR_H, fh - 0.05)
+    seen = set()
+    for corr_b in new_corr_breps:
+        cb = aabb(corr_b)
+        for core_b in cores_in:
+            rb = aabb(core_b)
+            if rb.Max.Z < z0 - EPS or rb.Min.Z > z1 + EPS:
+                continue
+            x_lo = max(cb.Min.X, rb.Min.X)
+            x_hi = min(cb.Max.X, rb.Max.X)
+            if x_hi - x_lo > EPS:
+                for (cy, ry, inward) in [
+                        (cb.Max.Y, rb.Min.Y, False),
+                        (cb.Min.Y, rb.Max.Y, True)]:
+                    if abs(cy - ry) < EPS:
+                        key = ('y', round(cy, 4), round(x_lo, 4), round(x_hi, 4))
+                        if key not in seen:
+                            seen.add(key)
+                            _corr_core_door('y', cy, inward, x_lo, x_hi, z0, z1, d_zhi)
+            y_lo = max(cb.Min.Y, rb.Min.Y)
+            y_hi = min(cb.Max.Y, rb.Max.Y)
+            if y_hi - y_lo > EPS:
+                for (cx, rx, inward) in [
+                        (cb.Max.X, rb.Min.X, False),
+                        (cb.Min.X, rb.Max.X, True)]:
+                    if abs(cx - rx) < EPS:
+                        key = ('x', round(cx, 4), round(y_lo, 4), round(y_hi, 4))
+                        if key not in seen:
+                            seen.add(key)
+                            _corr_core_door('x', cx, inward, y_lo, y_hi, z0, z1, d_zhi)
 
 
 # ------------------------------------------------------------
@@ -500,6 +733,7 @@ for fi, fb in enumerate(floors_sorted):
     z1 = bb.Max.Z
 
     fh = z1 - z0
+    corr_start = len(Corridor_Breps)
 
     long_is_x = (x1 - x0) >= (y1 - y0)
 
@@ -550,7 +784,8 @@ for fi, fb in enumerate(floors_sorted):
         ac = 0.5 * (amin + amax)
         ww = min(w, (amax - amin) * max_frac)
         t = wall_thickness
-        cut = AABz(ac - 0.5 * ww, ac + 0.5 * ww, C - t, C + t, zlo, zhi)
+        # EPS extension guarantees the cutter passes fully through both wall faces.
+        cut = AABz(ac - 0.5 * ww, ac + 0.5 * ww, C - t - EPS, C + t + EPS, zlo, zhi)
         pan = AABz(ac - 0.5 * ww, ac + 0.5 * ww, C - 0.5 * t, C + 0.5 * t, zlo, zhi)
         return cut, pan
 
@@ -559,7 +794,8 @@ for fi, fb in enumerate(floors_sorted):
         cc = 0.5 * (cmin + cmax)
         ww = min(w, (cmax - cmin) * max_frac)
         t = wall_thickness
-        cut = AABz(A - t, A + t, cc - 0.5 * ww, cc + 0.5 * ww, zlo, zhi)
+        # EPS extension guarantees the cutter passes fully through both wall faces.
+        cut = AABz(A - t - EPS, A + t + EPS, cc - 0.5 * ww, cc + 0.5 * ww, zlo, zhi)
         pan = AABz(A - 0.5 * t, A + 0.5 * t, cc - 0.5 * ww, cc + 0.5 * ww, zlo, zhi)
         return cut, pan
 
@@ -611,6 +847,14 @@ for fi, fb in enumerate(floors_sorted):
             emit(full, lab, aid, fi)
             return
 
+        # Warning-only: undersized rooms are generated but flagged.
+        if lab not in ("Hall", "Corridor"):
+            _int_a = in_a1 - in_a0
+            _int_c = in_c1 - in_c0
+            if min(_int_a, _int_c) < MIN_ROOM_DIM:
+                warn("%s Apt%d: %.2fm×%.2fm interior < %.1fm min" %
+                     (lab, aid, _int_a, _int_c, MIN_ROOM_DIM))
+
         interior = AAB(in_a0, in_a1, in_c0, in_c1)
 
         # Door z-range (clamped to floor height).
@@ -631,49 +875,78 @@ for fi, fb in enumerate(floors_sorted):
             if pan:
                 doors.append(pan)
 
-        # cR1: facade → exterior window.
-        # Non-facade cR1 is an internal v-partition; no door in hub-and-spoke
-        # (the adjacent v-strip room connects to the Hub via u-axis, not here).
+        # cR1: facade → exterior window (core-aware: skip core-blocked span).
         if is_facade:
-            ww, wzlo, wzhi = win_geometry(lab, amax - amin, fh, z0)
-            cut, pan = open_across(cR1, ww, wzlo, wzhi, amin, amax, max_frac=0.95)
-            if cut:
-                voids.append(cut)
-            if pan:
-                windows.append(pan)
+            _blk = _core_segment_overlap(cR1, not long_is_x, amin, amax)
+            free_lo, free_hi = _largest_free_segment(amin, amax, _blk)
+            free_span = free_hi - free_lo
+            _min_span = MIN_WINDOW_SPAN if lab == "Hall" else WIN_W + 2.0 * wall_thickness
+            if free_span >= _min_span:
+                ca = bool(_blk) or _faces_core_across_gap(
+                    cR1, not long_is_x, cR1 < cR0, amin, amax, corridor_width * 2.0)
+                ww, wzlo, wzhi = win_geometry(lab, free_span, fh, z0, core_aligned=ca)
+                cut, pan = open_across(cR1, ww, wzlo, wzhi, free_lo, free_hi, max_frac=0.95)
+                if cut:
+                    voids.append(cut)
+                if pan:
+                    windows.append(pan)
 
-        # along-min short side (constant along=amin)
+        # along-min short side (constant along=amin).
         if ext_lo:
-            ww, wzlo, wzhi = win_geometry(lab, cmax - cmin, fh, z0)
-            cut, pan = open_along(amin, ww, wzlo, wzhi, cmin, cmax, max_frac=0.95)
-            if cut:
-                voids.append(cut)
-            if pan:
-                windows.append(pan)
+            _blk = _core_segment_overlap(amin, long_is_x, cmin, cmax)
+            free_lo, free_hi = _largest_free_segment(cmin, cmax, _blk)
+            free_span = free_hi - free_lo
+            _min_span = MIN_WINDOW_SPAN if lab == "Hall" else WIN_W + 2.0 * wall_thickness
+            if free_span >= _min_span:
+                ca = bool(_blk) or _faces_core_across_gap(
+                    amin, long_is_x, True, cmin, cmax, corridor_width * 2.0)
+                ww, wzlo, wzhi = win_geometry(lab, free_span, fh, z0, core_aligned=ca)
+                cut, pan = open_along(amin, ww, wzlo, wzhi, free_lo, free_hi, max_frac=0.95)
+                if cut:
+                    voids.append(cut)
+                if pan:
+                    windows.append(pan)
 
-        # along-max short side (constant along=amax)
+        # along-max short side (constant along=amax).
         if ext_hi:
-            ww, wzlo, wzhi = win_geometry(lab, cmax - cmin, fh, z0)
-            cut, pan = open_along(amax, ww, wzlo, wzhi, cmin, cmax, max_frac=0.95)
-            if cut:
-                voids.append(cut)
-            if pan:
-                windows.append(pan)
+            _blk = _core_segment_overlap(amax, long_is_x, cmin, cmax)
+            free_lo, free_hi = _largest_free_segment(cmin, cmax, _blk)
+            free_span = free_hi - free_lo
+            _min_span = MIN_WINDOW_SPAN if lab == "Hall" else WIN_W + 2.0 * wall_thickness
+            if free_span >= _min_span:
+                ca = bool(_blk) or _faces_core_across_gap(
+                    amax, long_is_x, False, cmin, cmax, corridor_width * 2.0)
+                ww, wzlo, wzhi = win_geometry(lab, free_span, fh, z0, core_aligned=ca)
+                cut, pan = open_along(amax, ww, wzlo, wzhi, free_lo, free_hi, max_frac=0.95)
+                if cut:
+                    voids.append(cut)
+                if pan:
+                    windows.append(pan)
 
-        # --- build wall = full - interior - openings (single boolean) ---
-        subtract = [interior] + voids + (extra_voids or [])
-        res = rg.Brep.CreateBooleanDifference([full], subtract, TOL)
-
-        if not res:
-            # retry: hollow only (no openings) so we never lose the wall
-            res = rg.Brep.CreateBooleanDifference([full], [interior], TOL)
-
-        if res:
-            for r in res:
-                if r and r.IsSolid:
-                    emit_wall(r)
-        else:
+        # --- Step 1: create hollow shell (full − interior) ---
+        shells = rg.Brep.CreateBooleanDifference([full], [interior], TOL)
+        if not shells:
             emit_wall(full)  # last-resort: solid block
+        else:
+            shells = [s for s in shells if s and s.IsSolid]
+            # --- Step 2: subtract each opening void one at a time ---
+            # A failed subtraction issues a warning and keeps the current shell
+            # unchanged, so no void can silently vanish through a combined fallback.
+            for v in voids + (extra_voids or []):
+                if v is None or not shells:
+                    continue
+                next_shells = []
+                for sh in shells:
+                    res = rg.Brep.CreateBooleanDifference([sh], [v], TOL)
+                    if res:
+                        next_shells.extend(r for r in res if r and r.IsSolid)
+                    else:
+                        warn("Opening subtraction failed for %s Apt%d" % (lab, aid))
+                        next_shells.append(sh)
+                shells = [s for s in next_shells if s and s.IsSolid]
+            for sh in shells:
+                if sh and sh.IsSolid:
+                    emit_wall(sh)
 
         # room clear space + indicative opening volumes
         emit(interior, lab, aid, fi)
@@ -703,12 +976,23 @@ for fi, fb in enumerate(floors_sorted):
                 if sw is not None:
                     ori, coord, seg0, seg1 = sw
                     if is_open_plan_pair(_hub, rec[8]):
-                        # Full-height, full-width void — open plan, no wall, no door.
-                        span = seg1 - seg0
-                        if ori == "along":
-                            void_b, _ = open_along(coord, span, z0, z1, seg0, seg1, max_frac=0.99)
+                        # Hall ↔ Living: full-height open-plan cut.
+                        # End returns = wall_thickness at each end of the shared span;
+                        # cutter depth = 2*wall_thickness + 2*EPS to remove both half-wall shells.
+                        t = wall_thickness
+                        open_lo = seg0 + t
+                        open_hi = seg1 - t
+                        if open_hi - open_lo <= EPS:
+                            warn("Hall-Living shared wall %.2fm too short for open-plan cut" %
+                                 (seg1 - seg0))
+                            void_b = None
                         else:
-                            void_b, _ = open_across(coord, span, z0, z1, seg0, seg1, max_frac=0.99)
+                            if ori == "along":
+                                void_b = AABz(coord - t - EPS, coord + t + EPS,
+                                              open_lo, open_hi, z0, z1)
+                            else:
+                                void_b = AABz(open_lo, open_hi,
+                                              coord - t - EPS, coord + t + EPS, z0, z1)
                         pan_b = None
                     else:
                         if ori == "along":
@@ -814,6 +1098,8 @@ for fi, fb in enumerate(floors_sorted):
                 emit_apt(recs, apt, end_lo, end_hi)
                 apt += 1
                 tindex += 1
+
+    emit_corridor_core_doors(Corridor_Breps[corr_start:], z0, z1)
 
 
 # ------------------------------------------------------------

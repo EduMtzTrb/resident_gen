@@ -178,6 +178,24 @@ for fi in range(floors):
         residential.append(fb)
 
 # ----------------------------------------------------------------------
+# FLOOR SLABS (bar slabs + core slab per floor)
+# Bar slabs: one per bar per floor, no core hole (core slab is separate).
+# Core slab: one per floor, matching Core_Brep X/Y footprint exactly.
+# Slab bottom = base_z + fi * fh; thickness = t.
+# ----------------------------------------------------------------------
+floor_breps = []
+for fi in range(floors):
+    slab_z0 = base_z + fi * fh
+    slab_z1 = slab_z0 + t
+    for (bx0, bx1, by0, by1) in bars:
+        sb = box_brep(bx0, bx1, by0, by1, slab_z0, slab_z1)
+        if sb:
+            floor_breps.append(sb)
+    core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
+    if core_sb:
+        floor_breps.append(core_sb)
+
+# ----------------------------------------------------------------------
 # CORE (single vertical closed solid, ground -> roof)
 # ----------------------------------------------------------------------
 core_breps = [box_brep(core_x0, core_x1, core_y0, core_y1, core_z0, core_z1)]
@@ -212,10 +230,13 @@ if has_columns:
     placed = []   # (cx, cy) for deduplication across bars
 
     for (bx0, bx1, by0, by1) in bars:
-        # Grid anchored at bar corners — linspace(corner, corner, count)
-        # produces exactly count points with corners at both endpoints.
-        xs = linspace(bx0, bx1, grid_x)
-        ys = linspace(by0, by1, grid_y)
+        # Perimeter piloti outer face flush with bar wall.
+        # Column centre sits cs/2 inward so outer_face = centre - cs/2 = bar_edge.
+        if (bx1 - bx0) < cs + EPS or (by1 - by0) < cs + EPS:
+            warn("Bar (%.2f,%.2f)-(%.2f,%.2f) too narrow for columns; skipped." % (bx0, by0, bx1, by1))
+            continue
+        xs = linspace(bx0 + cs*0.5, bx1 - cs*0.5, grid_x)
+        ys = linspace(by0 + cs*0.5, by1 - cs*0.5, grid_y)
         for x in xs:
             for y in ys:
                 # skip under the core footprint
@@ -229,23 +250,32 @@ if has_columns:
                                              y - cs*0.5, y + cs*0.5,
                                              cz0, cz1))
 
-    # Corner verification report
+    # Corner verification report (flush outer-face check)
     shared_corners = []
     for bi, (bx0, bx1, by0, by1) in enumerate(bars):
-        corners = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)]
+        exp_corners = [
+            (bx0 + cs*0.5, by0 + cs*0.5),   # SW: west face=bx0, south face=by0
+            (bx1 - cs*0.5, by0 + cs*0.5),   # SE: east face=bx1, south face=by0
+            (bx0 + cs*0.5, by1 - cs*0.5),   # NW: west face=bx0, north face=by1
+            (bx1 - cs*0.5, by1 - cs*0.5),   # NE: east face=bx1, north face=by1
+        ]
         bar_pts = [(px, py) for (px, py) in placed
                    if bx0 - EPS <= px <= bx1 + EPS and by0 - EPS <= py <= by1 + EPS]
-        missing = [c for c in corners
+        missing = [c for c in exp_corners
                    if not any(abs(c[0]-px) < EPS and abs(c[1]-py) < EPS for px, py in bar_pts)]
         piloti_report.append(
-            "Bar %d (%.2f,%.2f)-(%.2f,%.2f): %d pilotis, corners OK=%s" % (
+            "Bar %d (%.2f,%.2f)-(%.2f,%.2f): %d pilotis, outer-faces-flush=YES, corners=%s" % (
                 bi + 1, bx0, by0, bx1, by1, len(bar_pts),
-                "YES" if not missing else "NO missing=%s" % str(missing)))
+                "YES" if not missing else "MISSING %s" % str(missing)))
     if len(bars) == 2:
-        c1s = [(bars[0][0], bars[0][2]), (bars[0][1], bars[0][2]),
-               (bars[0][0], bars[0][3]), (bars[0][1], bars[0][3])]
-        c2s = [(bars[1][0], bars[1][2]), (bars[1][1], bars[1][2]),
-               (bars[1][0], bars[1][3]), (bars[1][1], bars[1][3])]
+        c1s = [(bars[0][0]+cs*0.5, bars[0][2]+cs*0.5),
+               (bars[0][1]-cs*0.5, bars[0][2]+cs*0.5),
+               (bars[0][0]+cs*0.5, bars[0][3]-cs*0.5),
+               (bars[0][1]-cs*0.5, bars[0][3]-cs*0.5)]
+        c2s = [(bars[1][0]+cs*0.5, bars[1][2]+cs*0.5),
+               (bars[1][1]-cs*0.5, bars[1][2]+cs*0.5),
+               (bars[1][0]+cs*0.5, bars[1][3]-cs*0.5),
+               (bars[1][1]-cs*0.5, bars[1][3]-cs*0.5)]
         for (ax, ay) in c1s:
             for (bx, by) in c2s:
                 if abs(ax - bx) < EPS and abs(ay - by) < EPS:
@@ -269,6 +299,7 @@ all_ok = all_ok and validate(ground_breps, "ground")
 all_ok = all_ok and validate(column_breps, "columns")
 all_ok = all_ok and validate(residential,  "offices")
 all_ok = all_ok and validate(core_breps,   "core")
+all_ok = all_ok and validate(floor_breps,  "floor_slabs")
 
 # ----------------------------------------------------------------------
 # OUTPUTS
@@ -277,6 +308,7 @@ Ground_Breps      = ground_breps
 Column_Breps      = column_breps
 Residential_Breps = residential
 Core_Brep         = core_breps
+Floor_Breps       = floor_breps
 
 Preview_Colors = [sd.Color.FromArgb(150, 150, 150),   # ground
                   sd.Color.FromArgb(60, 60, 70),      # columns
@@ -290,7 +322,10 @@ BGR_Category = "%d - %s" % (cat, names.get(cat, "Separation"))
 
 print("Valid & closed" if all_ok else "Validation issues - see warnings")
 print("Category: " + BGR_Category)
-print("Counts -> ground:%d columns:%d offices:%d core:%d" % (
-    len(ground_breps), len(column_breps), len(residential), len(core_breps)))
+bar_slab_count = floors * len(bars)
+core_slab_count = floors
+print("Counts -> ground:%d columns:%d offices:%d core:%d floor_slabs:%d (bars:%d + core:%d)" % (
+    len(ground_breps), len(column_breps), len(residential), len(core_breps),
+    len(floor_breps), bar_slab_count, core_slab_count))
 for line in piloti_report:
     print(line)
