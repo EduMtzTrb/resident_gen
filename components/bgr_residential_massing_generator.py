@@ -64,6 +64,11 @@ if bgr_category < 0 or bgr_category > 4:
     bgr_category = 0
 cat = bgr_category
 
+massing_mode = int(globals().get('massing_mode', 0))
+if massing_mode not in (0, 1):
+    warn("massing_mode must be 0 or 1; defaulting to 0.")
+    massing_mode = 0
+
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
@@ -138,9 +143,30 @@ g_y0, g_y1 = -gm, W + gm
 cw = min(core_width, L * 0.5)
 cd = min(core_depth, W * 0.6)
 
-bars = []          # list of (x0,x1,y0,y1)
-core_in_gap = False
-if num_bars == 1:
+is_l_mode    = (massing_mode == 1)
+bars         = []          # list of (x0,x1,y0,y1) – used for column grid
+core_in_gap  = False
+
+if is_l_mode:
+    warn("L-shape mode is massing-only. "
+         "Do not connect L-shaped Residential_Breps to the current interior layout generator yet.")
+    half_w = W / 2.0
+    half_l = L / 2.0
+    # Two non-overlapping wing rectangles for the column grid.
+    # Main wing: full length × upper half width.
+    # Perp wing: right half length × lower half width.
+    bars = [
+        (0.0,    L,    half_w, W),
+        (half_l, L,    0.0,   half_w),
+    ]
+    # Core at the inner elbow: x0 flush with x = half_l, centred on y = half_w.
+    # Both halves of the core fall inside the L footprint (x >= half_l covers
+    # the perp wing below and the main wing above y = half_w).
+    core_x0 = half_l
+    core_x1 = min(L, half_l + cw)
+    core_y0 = max(0.0, half_w - cd / 2.0)
+    core_y1 = min(W,   core_y0 + cd)
+elif num_bars == 1:
     bars.append((0.0, L, 0.0, W))
     core_x0, core_x1 = 0.5 * (L - cw), 0.5 * (L + cw)
     core_y0, core_y1 = 0.5 * (W - cd), 0.5 * (W + cd)
@@ -170,12 +196,26 @@ residential = []
 for fi in range(floors):
     z0 = base_z + fi * fh
     z1 = z0 + fh
-    for (bx0, bx1, by0, by1) in bars:
-        fb = box_brep(bx0, bx1, by0, by1, z0, z1)
-        if not core_in_gap:   # central core: notch it out of each floor
-            cutter = box_brep(core_x0, core_x1, core_y0, core_y1, z0 - EPS, z1 + EPS)
-            fb = subtract(fb, cutter)
+    if is_l_mode:
+        # L-shaped floor: full rectangular envelope minus the void corner
+        # (bottom-left quadrant), then notch the core out.
+        # Using one Boolean difference avoids needing a reliable union of two
+        # touching boxes.
+        fb = box_brep(0.0, L, 0.0, W, z0, z1)
+        void_c = box_brep(-EPS, half_l, -EPS, half_w, z0 - EPS, z1 + EPS)
+        if void_c:
+            fb = subtract(fb, void_c)
+        core_cut = box_brep(core_x0, core_x1, core_y0, core_y1, z0 - EPS, z1 + EPS)
+        if core_cut:
+            fb = subtract(fb, core_cut)
         residential.append(fb)
+    else:
+        for (bx0, bx1, by0, by1) in bars:
+            fb = box_brep(bx0, bx1, by0, by1, z0, z1)
+            if not core_in_gap:   # central core: notch it out of each floor
+                cutter = box_brep(core_x0, core_x1, core_y0, core_y1, z0 - EPS, z1 + EPS)
+                fb = subtract(fb, cutter)
+            residential.append(fb)
 
 # ----------------------------------------------------------------------
 # FLOOR SLABS (bar slabs + core slab per floor)
@@ -187,13 +227,25 @@ floor_breps = []
 for fi in range(floors):
     slab_z0 = base_z + fi * fh
     slab_z1 = slab_z0 + t
-    for (bx0, bx1, by0, by1) in bars:
-        sb = box_brep(bx0, bx1, by0, by1, slab_z0, slab_z1)
+    if is_l_mode:
+        # L-shaped slab: full envelope minus the void corner.
+        sb = box_brep(0.0, L, 0.0, W, slab_z0, slab_z1)
+        void_c = box_brep(-EPS, half_l, -EPS, half_w, slab_z0 - EPS, slab_z1 + EPS)
+        if void_c:
+            sb = subtract(sb, void_c)
         if sb:
             floor_breps.append(sb)
-    core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
-    if core_sb:
-        floor_breps.append(core_sb)
+        core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
+        if core_sb:
+            floor_breps.append(core_sb)
+    else:
+        for (bx0, bx1, by0, by1) in bars:
+            sb = box_brep(bx0, bx1, by0, by1, slab_z0, slab_z1)
+            if sb:
+                floor_breps.append(sb)
+        core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
+        if core_sb:
+            floor_breps.append(core_sb)
 
 # ----------------------------------------------------------------------
 # CORE (single vertical closed solid, ground -> roof)
