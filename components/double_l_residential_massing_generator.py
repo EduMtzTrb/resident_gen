@@ -2,22 +2,22 @@
 # MaCAD S.3 - Double-L Residential Massing Generator
 # GHPython component / Rhino 8 Script Editor (Python 3)
 #
-# Generates a massing made from two offset L-shapes sharing a central
-# circulation core.  Four residential bars (two per L) surround the core.
-#
-# MASSING-ONLY — do not connect Residential_Breps to the interior
-# layout generator until that component supports four-bar configurations.
+# Two ┘-orientation L-shapes anchored to a fixed rectangular core.
+# Core: lower-left = (building_length, building_width), size = core_width × core_depth.
+# L-A grows left and down from core lower-left; L-B grows right and up from core upper-right.
+# All four bars have constant thickness = bar_width.
 #
 # INPUTS:
-#   building_length   building_width   wing_width   gap_width
-#   floors            floor_height     pilotis_height   slab_thickness
-#   column_size       grid_x           grid_y
-#   core_width        core_depth       offset_distance
+#   building_length  building_width
+#   bar0_length  bar1_length  bar2_length  bar3_length
+#   bar_width    core_width   core_depth
+#   floors       floor_height  pilotis_height  slab_thickness
+#   column_size  grid_x        grid_y
 #
 # OUTPUTS:
 #   Ground_Breps   Column_Breps   Residential_Breps   Core_Brep
 #   Floor_Breps    Preview_Colors Layer_Names          BGR_Category
-#   Bar_Id
+#   Bar_Id         Bar_Orientation Floor_Index
 
 import Rhino
 import Rhino.Geometry as rg
@@ -35,12 +35,6 @@ try:
 except:
     pass
 EPS = TOL * 5.0
-
-# Minimum face-segment overlap depth for a real bar/core connection.
-# Fixed at 0.10 m — deliberately independent of model tolerance so the
-# auto-extension threshold stays at gap_width + 2*CONN regardless of the
-# Rhino document unit or tolerance setting.
-CONN = 0.10
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -67,137 +61,117 @@ def box_brep(x0, x1, y0, y1, z0, z1):
         rg.Interval(z0, z1)
     ).ToBrep()
 
-def aabb(b):
-    return b.GetBoundingBox(True)
-
 def linspace(a, b, n):
     if n <= 1: return [0.5 * (a + b)]
     s = (b - a) / float(n - 1)
     return [a + i * s for i in range(n)]
 
 # ----------------------------------------------------------------------
-# Inputs — safe defaults
+# Inputs
 # ----------------------------------------------------------------------
-building_length  = float(dflt(building_length,  24.0))
-building_width   = float(dflt(building_width,   24.0))
-wing_width       = float(dflt(wing_width,        6.0))
-gap_width        = float(dflt(gap_width,         4.0))
-floors           = int(dflt(floors,              4))
-floor_height     = float(dflt(floor_height,      3.0))
-pilotis_height   = float(dflt(pilotis_height,    3.5))
-slab_thickness   = float(dflt(slab_thickness,    0.3))
-column_size      = float(dflt(column_size,       0.5))
-grid_x           = int(dflt(grid_x,             4))
-grid_y           = int(dflt(grid_y,             4))
-core_width       = float(dflt(core_width,        4.0))
-core_depth       = float(dflt(core_depth,        4.0))
-offset_distance  = float(dflt(offset_distance,   6.0))
+building_length = float(dflt(building_length, 24.0))
+building_width  = float(dflt(building_width,  24.0))
 
-floors  = max(1, floors)
-grid_x  = max(2, grid_x)
-grid_y  = max(2, grid_y)
+floors         = int(dflt(floors,           4))
+floor_height   = float(dflt(floor_height,   3.0))
+pilotis_height = float(dflt(pilotis_height, 3.5))
+slab_thickness = float(dflt(slab_thickness, 0.3))
+column_size    = float(dflt(column_size,    0.5))
+grid_x         = int(dflt(grid_x,          4))
+grid_y         = int(dflt(grid_y,          4))
 
-# ----------------------------------------------------------------------
-# Grasshopper compatibility warning
-# ----------------------------------------------------------------------
-warn(
-    "Double-L mode is massing-only.\n"
-    "Do not connect these Residential_Breps to the current interior layout generator yet."
-)
+bar0_length = float(dflt(bar0_length, building_length))
+bar1_length = float(dflt(bar1_length, building_width))
+bar2_length = float(dflt(bar2_length, building_length))
+bar3_length = float(dflt(bar3_length, building_width))
+bar_width   = float(dflt(bar_width,   6.0))
+core_width  = float(dflt(core_width,  6.0))
+core_depth  = float(dflt(core_depth,  6.0))
 
-# ----------------------------------------------------------------------
-# Derived level constants
-# ----------------------------------------------------------------------
-t          = slab_thickness
-ph         = max(pilotis_height, 0.1)
-fh         = floor_height
-ground_top = t
-base_z     = ground_top + ph       # pilotis: separation category only
-roof_top   = base_z + floors * fh
+floors = max(1, floors)
+grid_x = max(2, grid_x)
+grid_y = max(2, grid_y)
 
-L  = building_length   # horizontal bar X-span
-W  = building_width    # vertical bar Y-span
-ww = wing_width        # cross-section width of every bar
-gw = gap_width         # gap between the two L-shapes (= core zone width)
-od = offset_distance   # vertical shift applied to L-shape B only (can be negative)
+if bar_width <= EPS:
+    warn("bar_width %.4f <= 0 — set a positive value." % bar_width)
+if core_width <= EPS:
+    warn("core_width %.4f <= 0 — set a positive value." % core_width)
+if core_depth <= EPS:
+    warn("core_depth %.4f <= 0 — set a positive value." % core_depth)
 
 # ----------------------------------------------------------------------
-# Bar footprints — two mirrored L-shapes, L-shape B offset in Y by od
-#
-#   Top view (Y increases upward, od = 0 shown):
-#
-#   L-shape A                         L-shape B
-#
-#   Bar 0 ════════════════╗       ╔════════════════ Bar 2
-#   x:[0, L]              ║       ║                x:[L+gw, 2L+gw]
-#   y:[W, W+ww]           ║       ║                y:[W+od, W+od+ww]
-#                    Bar 1 ║       ║ Bar 3
-#                x:[L-ww, L]     x:[L+gw, L+gw+ww]
-#                y:[0, W]        y:[od, W+od]
-#
-#   Elbow A: y = W       (L-shape A, unchanged)
-#   Elbow B: y = W + od  (L-shape B, shifted by offset_distance)
-#   When od = 0 the arrangement is the same mirrored configuration as before.
+# Derived constants
 # ----------------------------------------------------------------------
+t        = slab_thickness
+ph       = max(pilotis_height, 0.1)
+fh       = floor_height
+base_z   = t + ph
+roof_top = base_z + floors * fh
+
+bw = bar_width
+
+# ----------------------------------------------------------------------
+# Core footprint — fixed at (building_length, building_width)
+# ----------------------------------------------------------------------
+core_x0 = building_length
+core_y0 = building_width
+core_x1 = core_x0 + core_width
+core_y1 = core_y0 + core_depth
+
+core_valid = (core_x1 - core_x0 > EPS and core_y1 - core_y0 > EPS)
+if not core_valid:
+    warn("Core is invalid. Increase core_width and core_depth.")
+
+# ----------------------------------------------------------------------
+# Bar footprints — L-A from core lower-left, L-B from core upper-right
+# ----------------------------------------------------------------------
+bar0_x1 = core_x0
+bar0_x0 = bar0_x1 - bar0_length
+bar0_y0 = core_y0
+bar0_y1 = bar0_y0 + bw
+
+bar1_x0 = core_x0 - bw
+bar1_x1 = core_x0
+bar1_y1 = core_y0
+bar1_y0 = bar1_y1 - bar1_length
+
+bar3_x0 = core_x1
+bar3_x1 = core_x1 + bw
+bar3_y1 = core_y1
+bar3_y0 = bar3_y1 - bar3_length
+
+bar2_x1 = bar3_x1
+bar2_x0 = bar2_x1 - bar2_length
+bar2_y0 = core_y1
+bar2_y1 = bar2_y0 + bw
+
 bar_footprints = [
-    (0.0,        L,            W,        W + ww),        # Bar 0: horizontal wing, L-A
-    (L - ww,     L,            0.0,      W),              # Bar 1: vertical wing,   L-A
-    (L + gw,     2.0*L + gw,   W + od,   W + od + ww),  # Bar 2: horizontal wing, L-B
-    (L + gw,     L + gw + ww,  od,       W + od),         # Bar 3: vertical wing,   L-B
+    (bar0_x0, bar0_x1, bar0_y0, bar0_y1),  # Bar 0 H L-A
+    (bar1_x0, bar1_x1, bar1_y0, bar1_y1),  # Bar 1 V L-A
+    (bar2_x0, bar2_x1, bar2_y0, bar2_y1),  # Bar 2 H L-B
+    (bar3_x0, bar3_x1, bar3_y0, bar3_y1),  # Bar 3 V L-B
 ]
 
-# ----------------------------------------------------------------------
-# Core geometry
-#
-#   Core X: centred on the gap between L-shape A and L-shape B.
-#     core_cx = L + gw/2
-#
-#   Core Y: centred between the two elbows.
-#     left_elbow_y  = W          (L-shape A elbow)
-#     right_elbow_y = W + od     (L-shape B elbow, offset)
-#     core_cy = 0.5 * (W + W+od) = W + od/2
-#
-#   The core must overlap into all four bars by at least CONN:
-#     X: half_cw > gw/2 + CONN        (reaches left bars past x=L
-#                                       and right bars past x=L+gw)
-#     Y: half_cd > abs(od)/2 + CONN   (reaches both elbows from the centre)
-#       → minimum core_depth = abs(od) + 2*CONN
-#
-#   Auto-extension fires and issues a warning only when the requested
-#   dimension is smaller than the minimum.
-# ----------------------------------------------------------------------
-core_cx = L + gw * 0.5
-left_elbow_y  = W
-right_elbow_y = W + od
-core_cy = 0.5 * (left_elbow_y + right_elbow_y)   # = W + od/2
+_b_thick = [
+    bar_footprints[0][3] - bar_footprints[0][2],
+    bar_footprints[1][1] - bar_footprints[1][0],
+    bar_footprints[2][3] - bar_footprints[2][2],
+    bar_footprints[3][1] - bar_footprints[3][0],
+]
+for _bid, _th in enumerate(_b_thick):
+    if abs(_th - bw) > EPS:
+        warn("Bar %d thickness %.4f != bar_width %.4f." % (_bid, _th, bw))
 
-half_cw = core_width  * 0.5
-half_cd = core_depth  * 0.5
+_core_clear = True
+if core_valid:
+    for _bid, (_bx0, _bx1, _by0, _by1) in enumerate(bar_footprints):
+        _ox = min(core_x1, _bx1) - max(core_x0, _bx0)
+        _oy = min(core_y1, _by1) - max(core_y0, _by0)
+        if _ox > EPS and _oy > EPS:
+            warn("Core overlaps Bar %d. Check core_width, core_depth, and bar lengths." % _bid)
+            _core_clear = False
 
-# X auto-extension: must reach both bars' inner faces with CONN margin.
-min_half_cw = gw * 0.5 + CONN
-if half_cw < min_half_cw:
-    warn(
-        "core_width %.2f is too narrow to reach all four bars across gap_width %.2f "
-        "(need >= %.2f); enlarged to %.2f."
-        % (core_width, gw, 2.0 * min_half_cw, 2.0 * min_half_cw)
-    )
-    half_cw = min_half_cw
-
-# Y auto-extension: must span from left elbow to right elbow with CONN margin each side.
-min_half_cd = abs(od) * 0.5 + CONN
-if half_cd < min_half_cd:
-    warn(
-        "core_depth %.2f is too shallow to reach all four bars with offset_distance %.2f "
-        "(need >= %.2f); enlarged to %.2f."
-        % (core_depth, od, 2.0 * min_half_cd, 2.0 * min_half_cd)
-    )
-    half_cd = min_half_cd
-
-core_x0 = core_cx - half_cw
-core_x1 = core_cx + half_cw
-core_y0 = core_cy - half_cd
-core_y1 = core_cy + half_cd
+core_ok = core_valid and _core_clear
 
 # ----------------------------------------------------------------------
 # Output initialisation
@@ -208,10 +182,13 @@ Residential_Breps = []
 Core_Brep         = []
 Floor_Breps       = []
 Bar_Id            = []
+Bar_Orientation   = []
+Floor_Index       = []
+
+_ORIENTATION = {0: "Horizontal", 1: "Vertical", 2: "Horizontal", 3: "Vertical"}
 
 # ----------------------------------------------------------------------
-# Residential bars — one Brep per bar per floor
-# Bar loop is identical to Task 3; core does not alter Residential_Breps.
+# Residential bars
 # ----------------------------------------------------------------------
 invalid_res = 0
 for fi in range(floors):
@@ -225,31 +202,23 @@ for fi in range(floors):
             continue
         Residential_Breps.append(b)
         Bar_Id.append(bid)
+        Bar_Orientation.append(_ORIENTATION[bid])
+        Floor_Index.append(fi)
 
 # ----------------------------------------------------------------------
-# Core — one continuous solid from ground to roof
-#
-# z0 = 0.0      (top face of Ground_Breps, where pilotis columns begin)
-# z1 = roof_top (top of the building)
-# Core_Brep count = 1  (replaces the previous per-floor approach)
-# Separate core slabs in Floor_Breps and the core ground slab in
-# Ground_Breps are unaffected.
+# Core — full height z=0 → roof_top
 # ----------------------------------------------------------------------
 invalid_core = 0
-cb = box_brep(core_x0, core_x1, core_y0, core_y1, 0.0, roof_top)
-if cb is None or not cb.IsValid or not cb.IsSolid:
-    warn("Core: invalid Brep — check core_width, core_depth.")
-    invalid_core += 1
-else:
-    Core_Brep.append(cb)
+if core_ok:
+    cb = box_brep(core_x0, core_x1, core_y0, core_y1, 0.0, roof_top)
+    if cb is None or not cb.IsValid or not cb.IsSolid:
+        warn("Core: invalid Brep — check core_width and core_depth.")
+        invalid_core += 1
+    else:
+        Core_Brep.append(cb)
 
 # ----------------------------------------------------------------------
 # Floor slabs — four bar slabs + one core slab per floor
-#
-# Order within each floor: Bar 0, Bar 1, Bar 2, Bar 3, Core.
-# slab_z0 = base_z + fi*fh         (bottom face of this floor)
-# slab_z1 = slab_z0 + t            (slab top, t = slab_thickness)
-# Overlap at core/bar joints is intentional; no Boolean ops at this stage.
 # ----------------------------------------------------------------------
 invalid_slab = 0
 for fi in range(floors):
@@ -262,34 +231,28 @@ for fi in range(floors):
             invalid_slab += 1
             continue
         Floor_Breps.append(sb)
-    core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
-    if core_sb is None or not core_sb.IsValid or not core_sb.IsSolid:
-        warn("Core slab floor %d: invalid Brep." % fi)
-        invalid_slab += 1
-        continue
-    Floor_Breps.append(core_sb)
+    if core_ok:
+        core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
+        if core_sb is None or not core_sb.IsValid or not core_sb.IsSolid:
+            warn("Core slab floor %d: invalid Brep." % fi)
+            invalid_slab += 1
+            continue
+        Floor_Breps.append(core_sb)
 
 # ----------------------------------------------------------------------
-# Pilotis columns — all four bar footprints, z = 0 → base_z
-#
-# Grid: grid_x × grid_y centres distributed across each bar, with
-# outer columns flush inside the bar edge (centre = edge + cs/2).
-# Deduplication: a (rounded-x, rounded-y) key set prevents columns
-# appearing twice at L elbows or anywhere two bars share a corner.
-# Core exclusion zone: the core footprint expanded by cs/2 on every
-# side; any column centre inside that zone is skipped.
+# Pilotis columns — grid_x × grid_y per bar, z=0 → base_z
+# Core exclusion zone: core footprint expanded by cs/2.
 # ----------------------------------------------------------------------
-cs   = column_size
-cz0  = 0.0        # column bottom: actual ground
-cz1  = base_z     # column top:    underside of first residential slab
+cs  = column_size
+cz0 = 0.0
+cz1 = base_z
 
-# Expanded core exclusion zone.
 exc_x0 = core_x0 - cs * 0.5
 exc_x1 = core_x1 + cs * 0.5
 exc_y0 = core_y0 - cs * 0.5
 exc_y1 = core_y1 + cs * 0.5
 
-placed_keys = set()   # (round(x,3), round(y,3)) — deduplication across all bars
+placed_keys = set()
 invalid_col  = 0
 
 for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
@@ -300,10 +263,8 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
     ys = linspace(by0 + cs * 0.5, by1 - cs * 0.5, grid_y)
     for x in xs:
         for y in ys:
-            # Skip if inside expanded core exclusion zone.
             if exc_x0 <= x <= exc_x1 and exc_y0 <= y <= exc_y1:
                 continue
-            # Skip duplicates (shared elbow corners between bars).
             key = (round(x, 3), round(y, 3))
             if key in placed_keys:
                 continue
@@ -321,41 +282,49 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
 # Validation
 # ----------------------------------------------------------------------
 exp_res  = floors * 4
-exp_core = 1            # one continuous core solid (z=0 → roof_top)
-exp_slab = floors * 5   # 4 bar slabs + 1 core slab per floor
+exp_core = 1 if core_ok else 0
+exp_slab = floors * (5 if core_ok else 4)
+exp_gnd  = 5 if core_ok else 4
 
 if len(Residential_Breps) != exp_res:
     warn("Residential_Breps count %d != expected %d." % (len(Residential_Breps), exp_res))
 if len(Bar_Id) != len(Residential_Breps):
     warn("Bar_Id length %d != Residential_Breps length %d — not parallel."
          % (len(Bar_Id), len(Residential_Breps)))
+if len(Bar_Orientation) != len(Residential_Breps):
+    warn("Bar_Orientation length %d != Residential_Breps length %d — not parallel."
+         % (len(Bar_Orientation), len(Residential_Breps)))
+if len(Floor_Index) != len(Residential_Breps):
+    warn("Floor_Index length %d != Residential_Breps length %d — not parallel."
+         % (len(Floor_Index), len(Residential_Breps)))
+for i, bid in enumerate(Bar_Id):
+    if Bar_Orientation[i] != _ORIENTATION[bid]:
+        warn("Bar_Orientation[%d] '%s' != expected '%s' for Bar_Id %d."
+             % (i, Bar_Orientation[i], _ORIENTATION[bid], bid))
 if len(Core_Brep) != exp_core:
-    warn("Core_Brep count %d != expected %d (one per floor)."
-         % (len(Core_Brep), exp_core))
+    warn("Core_Brep count %d != expected %d." % (len(Core_Brep), exp_core))
 if len(Floor_Breps) != exp_slab:
-    warn("Floor_Breps count %d != expected %d (%d floors x 5)."
-         % (len(Floor_Breps), exp_slab, floors))
+    warn("Floor_Breps count %d != expected %d (%d floors x %d)."
+         % (len(Floor_Breps), exp_slab, floors, 5 if core_ok else 4))
 
-# Per-bar XY connection check: verify core footprint overlaps each bar footprint.
-conn_ok = [False, False, False, False]
-for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
-    ox = min(core_x1, bx1) - max(core_x0, bx0)
-    oy = min(core_y1, by1) - max(core_y0, by0)
-    if ox > EPS and oy > EPS:
-        conn_ok[bid] = True
-    else:
-        warn("Core does not reach Bar %d (ox=%.4f oy=%.4f)." % (bid, ox, oy))
+def _bars_touch(fp1, fp2):
+    bx0,bx1,by0,by1 = fp1; ax0,ax1,ay0,ay1 = fp2
+    xov = min(bx1,ax1) - max(bx0,ax0)
+    yov = min(by1,ay1) - max(by0,ay0)
+    return (xov > EPS and yov >= -EPS) or (yov > EPS and xov >= -EPS)
 
+c_01 = _bars_touch(bar_footprints[0], bar_footprints[1])
+c_23 = _bars_touch(bar_footprints[2], bar_footprints[3])
+
+if not c_01:
+    warn("Bar 0 ↔ Bar 1: no face connection — check bar0_length vs bar_width.")
+if not c_23:
+    warn("Bar 2 ↔ Bar 3: no face connection — check bar2_length vs bar_width.")
 if not Column_Breps:
     warn("Column_Breps is empty — check column_size vs bar dimensions.")
 
 # ----------------------------------------------------------------------
-# Ground slabs — one per bar + one for core, sitting below world Z=0
-#
-# z0 = -t  (slab bottom, below world ground)
-# z1 =  0  (slab top flush with world Z=0 where pilotis columns begin)
-# Order: Bar 0, Bar 1, Bar 2, Bar 3, Core
-# Overlap at core/bar joints is intentional; no Boolean ops at this stage.
+# Ground slabs
 # ----------------------------------------------------------------------
 gs_z0 = -t
 gs_z1 = 0.0
@@ -367,67 +336,46 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
         invalid_gnd += 1
         continue
     Ground_Breps.append(gs)
-core_gs = box_brep(core_x0, core_x1, core_y0, core_y1, gs_z0, gs_z1)
-if core_gs is None or not core_gs.IsValid or not core_gs.IsSolid:
-    warn("Core ground slab: invalid Brep.")
-    invalid_gnd += 1
-else:
-    Ground_Breps.append(core_gs)
+if core_ok:
+    core_gs = box_brep(core_x0, core_x1, core_y0, core_y1, gs_z0, gs_z1)
+    if core_gs is None or not core_gs.IsValid or not core_gs.IsSolid:
+        warn("Core ground slab: invalid Brep.")
+        invalid_gnd += 1
+    else:
+        Ground_Breps.append(core_gs)
 
-if len(Ground_Breps) != 5:
-    warn("Ground_Breps count %d != expected 5." % len(Ground_Breps))
+if len(Ground_Breps) != exp_gnd:
+    warn("Ground_Breps count %d != expected %d." % (len(Ground_Breps), exp_gnd))
 
 # ----------------------------------------------------------------------
 # Preview metadata
 # ----------------------------------------------------------------------
-CORE_COLOR = sd.Color.FromArgb(220, 190,  60)   # gold / amber for core
-
 Preview_Colors = [
     sd.Color.FromArgb(70,  130, 200),   # Bar 0 — blue
     sd.Color.FromArgb(80,  180, 100),   # Bar 1 — green
     sd.Color.FromArgb(210, 120,  50),   # Bar 2 — orange
     sd.Color.FromArgb(200,  60,  60),   # Bar 3 — red
-    CORE_COLOR,                          # Core  — gold
+    sd.Color.FromArgb(220, 190,  60),   # Core  — gold
 ]
 Layer_Names  = ["L_A_Horizontal", "L_A_Vertical", "L_B_Horizontal", "L_B_Vertical", "Core"]
-BGR_Category = "Double-L_Core_Test"
+BGR_Category = "Double-L_Core"
 
 # ----------------------------------------------------------------------
 # Console report
 # ----------------------------------------------------------------------
-print("Double-L massing — Task 6: continuous core + offset L-shape B.")
-print("Inputs:")
-print("  building_length=%.2f  building_width=%.2f" % (L, W))
-print("  wing_width=%.2f       gap_width=%.2f  offset_distance=%.2f" % (ww, gw, od))
-print("  core_width=%.2f       core_depth=%.2f" % (core_width, core_depth))
-print("  floors=%d  floor_height=%.2f  base_z=%.3f" % (floors, fh, base_z))
-print("Core footprint:")
-print("  centre x=%.3f  y=%.3f  (left_elbow_y=%.2f  right_elbow_y=%.2f)"
-      % (core_cx, core_cy, left_elbow_y, right_elbow_y))
-print("  x=[%.3f, %.3f]  y=[%.3f, %.3f]" % (core_x0, core_x1, core_y0, core_y1))
-print("  half_cw=%.3f (requested %.3f)  half_cd=%.3f (requested %.3f)"
-      % (half_cw, core_width*0.5, half_cd, core_depth*0.5))
-print("  z=[0.000, %.3f]  (ground → roof_top)  count=%d" % (roof_top, len(Core_Brep)))
-print("Bar connections (core overlaps each bar in XY):")
-for bid, ok in enumerate(conn_ok):
-    bx0, bx1, by0, by1 = bar_footprints[bid]
-    ox = min(core_x1, bx1) - max(core_x0, bx0)
-    oy = min(core_y1, by1) - max(core_y0, by0)
-    print("  Bar %d: %s  overlap x=%.3f  y=%.3f" % (bid, "OK" if ok else "FAIL", ox, oy))
-print("Residential_Breps : %d  (expected %d)  invalid=%d"
-      % (len(Residential_Breps), exp_res, invalid_res))
-print("Bar_Id            : %d  — %s"
-      % (len(Bar_Id), ("parallel OK" if len(Bar_Id) == len(Residential_Breps) else "MISMATCH")))
-print("Core_Brep         : %d  (expected %d)  invalid=%d"
-      % (len(Core_Brep), exp_core, invalid_core))
-print("Floor_Breps       : %d  (expected %d = %d floors x 5)  invalid=%d"
-      % (len(Floor_Breps), exp_slab, floors, invalid_slab))
-print("  slab order/floor: Bar0 Bar1 Bar2 Bar3 Core")
-print("  slab z placement: slab_z0 = base_z + fi*fh  slab_z1 = slab_z0 + t (t=%.3f)" % t)
-print("Column_Breps      : %d  (invalid=%d  duplicates/core-excluded removed)"
-      % (len(Column_Breps), invalid_col))
-print("  column z: [%.3f, %.3f]  (ground → base_z)" % (cz0, cz1))
-print("  core excl zone: x=[%.3f,%.3f]  y=[%.3f,%.3f]" % (exc_x0, exc_x1, exc_y0, exc_y1))
-print("Ground_Breps      : %d  (expected 5)  invalid=%d" % (len(Ground_Breps), invalid_gnd))
-print("  ground slab order: Bar0 Bar1 Bar2 Bar3 Core")
-print("  ground slab z: [%.3f, 0.000]  (-slab_thickness → world Z=0)" % gs_z0)
+_orient = {0: "H", 1: "V", 2: "H", 3: "V"}
+_lbl    = lambda ok: "OK" if ok else "FAIL"
+
+print("Double-L  floors=%d  core_ok=%s  bar_width=%.2f" % (floors, core_ok, bw))
+print("  building=%.2f×%.2f  core=%.2f×%.2f" % (building_length, building_width, core_width, core_depth))
+print("  core: x=[%.3f, %.3f]  y=[%.3f, %.3f]" % (core_x0, core_x1, core_y0, core_y1))
+for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
+    print("  Bar %d (%s): x=[%.3f, %.3f]  y=[%.3f, %.3f]  t=%.3f"
+          % (bid, _orient[bid], bx0, bx1, by0, by1, _b_thick[bid]))
+print("  contacts: 01=%s  23=%s" % (_lbl(c_01), _lbl(c_23)))
+print("  Residential=%d/%d  Core=%d/%d  Floor=%d/%d  Ground=%d/%d  Columns=%d"
+      % (len(Residential_Breps), exp_res,
+         len(Core_Brep), exp_core,
+         len(Floor_Breps), exp_slab,
+         len(Ground_Breps), exp_gnd,
+         len(Column_Breps)))
