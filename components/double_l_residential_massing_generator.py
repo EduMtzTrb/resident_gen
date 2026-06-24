@@ -125,28 +125,27 @@ core_valid = (core_x1 - core_x0 > EPS and core_y1 - core_y0 > EPS)
 if not core_valid:
     warn("Core is invalid. Increase core_width and core_depth.")
 
-# Corner core footprints — kept for column exclusion only (no geometry generated).
+# Corner core footprints — bw × bw squares at inner L corners.
 cw = corridor_width
 la_core_x0 = core_x0 - bw;  la_core_x1 = core_x0
-la_core_y0 = core_y0;        la_core_y1 = core_y0 + bw - cw
+la_core_y0 = core_y0;        la_core_y1 = core_y0 + bw
 
 lb_core_x0 = core_x1;        lb_core_x1 = core_x1 + bw
-lb_core_y0 = core_y1 + cw;   lb_core_y1 = core_y1 + bw
+lb_core_y0 = core_y1;        lb_core_y1 = core_y1 + bw
 
-# Spine split at bar-0 top face (y = core_y0 + bw).
-# Spine_Lower: y=[core_y0, core_y0+bw]  — aligns with bars 0 and 1.
-# Spine_Upper: y=[core_y0+bw, core_y1]  — only exists when core_depth > bar_width.
+# Core volumes: LA_corner + optional Spine_Upper + LB_corner (all z=0 → roof_top).
 _spine_cut = core_y0 + bw
-_CORES = []
+_CORES = [("LA_corner", la_core_x0, la_core_x1, la_core_y0, la_core_y1)]
 if core_y1 > _spine_cut + EPS:
     _CORES.append(("Spine_Upper", core_x0, core_x1, _spine_cut, core_y1))
 else:
     warn("Spine_Upper skipped: core_depth (%.2f) <= bar_width (%.2f) — increase core_depth." % (core_depth, bw))
+_CORES.append(("LB_corner", lb_core_x0, lb_core_x1, lb_core_y0, lb_core_y1))
 
 # ----------------------------------------------------------------------
 # Bar footprints — L-A from core lower-left, L-B from core upper-right
 # ----------------------------------------------------------------------
-bar0_x1 = core_x0
+bar0_x1 = core_x0 - bw          # stops at LA_corner west face
 bar0_x0 = bar0_x1 - bar0_length
 bar0_y0 = core_y0
 bar0_y1 = bar0_y0 + bw
@@ -161,7 +160,7 @@ bar3_x1 = core_x1 + bw
 bar3_y1 = core_y1
 bar3_y0 = bar3_y1 - bar3_length
 
-bar2_x1 = bar3_x1
+bar2_x1 = core_x1               # stops at LB_corner west face
 bar2_x0 = bar2_x1 - bar2_length
 bar2_y0 = core_y1
 bar2_y1 = bar2_y0 + bw
@@ -383,8 +382,8 @@ if len(Ground_Breps) != exp_gnd:
 # Circulation — corridor strips + connectors per residential floor
 # ----------------------------------------------------------------------
 _corr_spec = [
-    (0, bar0_x0,       bar3_x0,       bar0_y1 - cw,  bar0_y1),       # Bar 0 North (merged with LINK_B0B3 to bar3 west)
-    (1, bar1_x1 - cw,  bar1_x1,       bar1_y0,        bar2_y0),       # Bar 1 East (merged with LINK_B1 to bar2 south)
+    (0, bar0_x0,       bar0_x1,       bar0_y1 - cw,  bar0_y1),       # Bar 0 North
+    (1, bar1_x1 - cw,  bar1_x1,       bar1_y0,        bar1_y1),       # Bar 1 East
     (2, bar2_x0,       bar2_x1,       bar2_y0,        bar2_y0 + cw),  # Bar 2 South
     (3, bar3_x0,       bar3_x0 + cw,  bar3_y0,        bar3_y1),       # Bar 3 West
 ]
