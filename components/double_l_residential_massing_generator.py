@@ -10,7 +10,7 @@
 # INPUTS:
 #   building_length  building_width
 #   bar0_length  bar1_length  bar2_length  bar3_length
-#   bar_width    core_width   core_depth
+#   bar_width    core_width   core_depth   corridor_width
 #   floors       floor_height  pilotis_height  slab_thickness
 #   column_size  grid_x        grid_y
 #
@@ -84,9 +84,10 @@ bar0_length = float(dflt(bar0_length, building_length))
 bar1_length = float(dflt(bar1_length, building_width))
 bar2_length = float(dflt(bar2_length, building_length))
 bar3_length = float(dflt(bar3_length, building_width))
-bar_width   = float(dflt(bar_width,   6.0))
-core_width  = float(dflt(core_width,  6.0))
-core_depth  = float(dflt(core_depth,  6.0))
+bar_width      = float(dflt(bar_width,      6.0))
+core_width     = float(dflt(core_width,     6.0))
+core_depth     = float(dflt(core_depth,     6.0))
+corridor_width = float(dflt(corridor_width, 1.5))
 
 floors = max(1, floors)
 grid_x = max(2, grid_x)
@@ -98,6 +99,8 @@ if core_width <= EPS:
     warn("core_width %.4f <= 0 — set a positive value." % core_width)
 if core_depth <= EPS:
     warn("core_depth %.4f <= 0 — set a positive value." % core_depth)
+if corridor_width >= bar_width - EPS:
+    warn("corridor_width %.4f >= bar_width %.4f — corner cores will be zero-height." % (corridor_width, bar_width))
 
 # ----------------------------------------------------------------------
 # Derived constants
@@ -121,6 +124,24 @@ core_y1 = core_y0 + core_depth
 core_valid = (core_x1 - core_x0 > EPS and core_y1 - core_y0 > EPS)
 if not core_valid:
     warn("Core is invalid. Increase core_width and core_depth.")
+
+# Corner core footprints — kept for column exclusion only (no geometry generated).
+cw = corridor_width
+la_core_x0 = core_x0 - bw;  la_core_x1 = core_x0
+la_core_y0 = core_y0;        la_core_y1 = core_y0 + bw - cw
+
+lb_core_x0 = core_x1;        lb_core_x1 = core_x1 + bw
+lb_core_y0 = core_y1 + cw;   lb_core_y1 = core_y1 + bw
+
+# Spine split at bar-0 top face (y = core_y0 + bw).
+# Spine_Lower: y=[core_y0, core_y0+bw]  — aligns with bars 0 and 1.
+# Spine_Upper: y=[core_y0+bw, core_y1]  — only exists when core_depth > bar_width.
+_spine_cut = core_y0 + bw
+_CORES = []
+if core_y1 > _spine_cut + EPS:
+    _CORES.append(("Spine_Upper", core_x0, core_x1, _spine_cut, core_y1))
+else:
+    warn("Spine_Upper skipped: core_depth (%.2f) <= bar_width (%.2f) — increase core_depth." % (core_depth, bw))
 
 # ----------------------------------------------------------------------
 # Bar footprints — L-A from core lower-left, L-B from core upper-right
@@ -176,14 +197,19 @@ core_ok = core_valid and _core_clear
 # ----------------------------------------------------------------------
 # Output initialisation
 # ----------------------------------------------------------------------
-Ground_Breps      = []
-Column_Breps      = []
-Residential_Breps = []
-Core_Brep         = []
-Floor_Breps       = []
-Bar_Id            = []
-Bar_Orientation   = []
-Floor_Index       = []
+Ground_Breps            = []
+Column_Breps            = []
+Residential_Breps       = []
+Core_Brep               = []
+Floor_Breps             = []
+Bar_Id                  = []
+Bar_Orientation         = []
+Floor_Index             = []
+Circulation_Breps       = []
+Circulation_Types       = []
+Circulation_Floor_Index = []
+Circulation_Bar_Id      = []
+Circulation_Id          = []
 
 _ORIENTATION = {0: "Horizontal", 1: "Vertical", 2: "Horizontal", 3: "Vertical"}
 
@@ -206,16 +232,17 @@ for fi in range(floors):
         Floor_Index.append(fi)
 
 # ----------------------------------------------------------------------
-# Core — full height z=0 → roof_top
+# Core — three volumes: LA corner, spine, LB corner; all z=0 → roof_top
 # ----------------------------------------------------------------------
 invalid_core = 0
 if core_ok:
-    cb = box_brep(core_x0, core_x1, core_y0, core_y1, 0.0, roof_top)
-    if cb is None or not cb.IsValid or not cb.IsSolid:
-        warn("Core: invalid Brep — check core_width and core_depth.")
-        invalid_core += 1
-    else:
-        Core_Brep.append(cb)
+    for _clabel, _cx0, _cx1, _cy0, _cy1 in _CORES:
+        cb = box_brep(_cx0, _cx1, _cy0, _cy1, 0.0, roof_top)
+        if cb is None or not cb.IsValid or not cb.IsSolid:
+            warn("%s core: invalid Brep." % _clabel)
+            invalid_core += 1
+        else:
+            Core_Brep.append(cb)
 
 # ----------------------------------------------------------------------
 # Floor slabs — four bar slabs + one core slab per floor
@@ -232,12 +259,13 @@ for fi in range(floors):
             continue
         Floor_Breps.append(sb)
     if core_ok:
-        core_sb = box_brep(core_x0, core_x1, core_y0, core_y1, slab_z0, slab_z1)
-        if core_sb is None or not core_sb.IsValid or not core_sb.IsSolid:
-            warn("Core slab floor %d: invalid Brep." % fi)
-            invalid_slab += 1
-            continue
-        Floor_Breps.append(core_sb)
+        for _clabel, _cx0, _cx1, _cy0, _cy1 in _CORES:
+            core_sb = box_brep(_cx0, _cx1, _cy0, _cy1, slab_z0, slab_z1)
+            if core_sb is None or not core_sb.IsValid or not core_sb.IsSolid:
+                warn("%s core slab floor %d: invalid Brep." % (_clabel, fi))
+                invalid_slab += 1
+            else:
+                Floor_Breps.append(core_sb)
 
 # ----------------------------------------------------------------------
 # Pilotis columns — grid_x × grid_y per bar, z=0 → base_z
@@ -247,10 +275,11 @@ cs  = column_size
 cz0 = 0.0
 cz1 = base_z
 
-exc_x0 = core_x0 - cs * 0.5
-exc_x1 = core_x1 + cs * 0.5
-exc_y0 = core_y0 - cs * 0.5
-exc_y1 = core_y1 + cs * 0.5
+_exc_zones = [
+    (la_core_x0 - cs*0.5, la_core_x1 + cs*0.5, la_core_y0 - cs*0.5, la_core_y1 + cs*0.5),
+    (core_x0    - cs*0.5, core_x1    + cs*0.5, core_y0    - cs*0.5, core_y1    + cs*0.5),
+    (lb_core_x0 - cs*0.5, lb_core_x1 + cs*0.5, lb_core_y0 - cs*0.5, lb_core_y1 + cs*0.5),
+]
 
 placed_keys = set()
 invalid_col  = 0
@@ -263,7 +292,8 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
     ys = linspace(by0 + cs * 0.5, by1 - cs * 0.5, grid_y)
     for x in xs:
         for y in ys:
-            if exc_x0 <= x <= exc_x1 and exc_y0 <= y <= exc_y1:
+            if any(ex0 <= x <= ex1 and ey0 <= y <= ey1
+                   for ex0, ex1, ey0, ey1 in _exc_zones):
                 continue
             key = (round(x, 3), round(y, 3))
             if key in placed_keys:
@@ -282,9 +312,10 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
 # Validation
 # ----------------------------------------------------------------------
 exp_res  = floors * 4
-exp_core = 1 if core_ok else 0
-exp_slab = floors * (5 if core_ok else 4)
-exp_gnd  = 5 if core_ok else 4
+_n_cores = len(_CORES)
+exp_core = _n_cores if core_ok else 0
+exp_slab = floors * ((4 + _n_cores) if core_ok else 4)
+exp_gnd  = (4 + _n_cores) if core_ok else 4
 
 if len(Residential_Breps) != exp_res:
     warn("Residential_Breps count %d != expected %d." % (len(Residential_Breps), exp_res))
@@ -337,15 +368,76 @@ for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
         continue
     Ground_Breps.append(gs)
 if core_ok:
-    core_gs = box_brep(core_x0, core_x1, core_y0, core_y1, gs_z0, gs_z1)
-    if core_gs is None or not core_gs.IsValid or not core_gs.IsSolid:
-        warn("Core ground slab: invalid Brep.")
-        invalid_gnd += 1
-    else:
-        Ground_Breps.append(core_gs)
+    for _clabel, _cx0, _cx1, _cy0, _cy1 in _CORES:
+        core_gs = box_brep(_cx0, _cx1, _cy0, _cy1, gs_z0, gs_z1)
+        if core_gs is None or not core_gs.IsValid or not core_gs.IsSolid:
+            warn("%s core ground slab: invalid Brep." % _clabel)
+            invalid_gnd += 1
+        else:
+            Ground_Breps.append(core_gs)
 
 if len(Ground_Breps) != exp_gnd:
     warn("Ground_Breps count %d != expected %d." % (len(Ground_Breps), exp_gnd))
+
+# ----------------------------------------------------------------------
+# Circulation — corridor strips + connectors per residential floor
+# ----------------------------------------------------------------------
+_corr_spec = [
+    (0, bar0_x0,       bar3_x0,       bar0_y1 - cw,  bar0_y1),       # Bar 0 North (merged with LINK_B0B3 to bar3 west)
+    (1, bar1_x1 - cw,  bar1_x1,       bar1_y0,        bar2_y0),       # Bar 1 East (merged with LINK_B1 to bar2 south)
+    (2, bar2_x0,       bar2_x1,       bar2_y0,        bar2_y0 + cw),  # Bar 2 South
+    (3, bar3_x0,       bar3_x0 + cw,  bar3_y0,        bar3_y1),       # Bar 3 West
+]
+
+_circ_floor_stats = {}  # fi -> [corridors, connectors, missing_bids]
+
+for fi in range(floors):
+    fz0 = base_z + fi * fh
+    fz1 = fz0 + fh
+
+    # ---- corridor strips ----
+    _corr_bbs = {}   # bid -> (x0, x1, y0, y1)
+    _missing   = []
+
+    for bid, cx0, cx1, cy0, cy1 in _corr_spec:
+        if cw <= EPS:
+            _missing.append(bid)
+            continue
+        if cw >= bw - EPS:
+            _missing.append(bid)
+            warn("Floor %d bar %d: corridor_width >= bar_width — skipped." % (fi, bid))
+            continue
+        cb = box_brep(cx0, cx1, cy0, cy1, fz0, fz1)
+        if cb is None or not cb.IsValid or not cb.IsSolid:
+            _missing.append(bid)
+            warn("Floor %d bar %d: corridor Brep invalid." % (fi, bid))
+            continue
+        Circulation_Breps.append(cb)
+        Circulation_Types.append("Corridor")
+        Circulation_Floor_Index.append(fi)
+        Circulation_Bar_Id.append(bid)
+        Circulation_Id.append("F%d_B%d_COR" % (fi, bid))
+        _corr_bbs[bid] = (cx0, cx1, cy0, cy1)
+
+    if _missing:
+        warn("Floor %d: missing corridor bars %s." % (fi, _missing))
+
+    _circ_floor_stats[fi] = [len(_corr_bbs), _missing]
+
+# Validate — warn if any circulation Brep's AABB overlaps a Core_Brep AABB
+for _ci, _cb in enumerate(Circulation_Breps):
+    if not _cb.IsValid:
+        continue
+    _cbb = _cb.GetBoundingBox(True)
+    for _core in Core_Brep:
+        if _core is None or not _core.IsValid:
+            continue
+        _kbb = _core.GetBoundingBox(True)
+        _ox = min(_cbb.Max.X, _kbb.Max.X) - max(_cbb.Min.X, _kbb.Min.X)
+        _oy = min(_cbb.Max.Y, _kbb.Max.Y) - max(_cbb.Min.Y, _kbb.Min.Y)
+        _oz = min(_cbb.Max.Z, _kbb.Max.Z) - max(_cbb.Min.Z, _kbb.Min.Z)
+        if _ox > EPS and _oy > EPS and _oz > EPS:
+            warn("Circulation[%d] %s: AABB overlaps Core_Brep volume." % (_ci, Circulation_Id[_ci]))
 
 # ----------------------------------------------------------------------
 # Preview metadata
@@ -366,9 +458,10 @@ BGR_Category = "Double-L_Core"
 _orient = {0: "H", 1: "V", 2: "H", 3: "V"}
 _lbl    = lambda ok: "OK" if ok else "FAIL"
 
-print("Double-L  floors=%d  core_ok=%s  bar_width=%.2f" % (floors, core_ok, bw))
+print("Double-L  floors=%d  core_ok=%s  bar_width=%.2f  corridor_width=%.2f" % (floors, core_ok, bw, cw))
 print("  building=%.2f×%.2f  core=%.2f×%.2f" % (building_length, building_width, core_width, core_depth))
-print("  core: x=[%.3f, %.3f]  y=[%.3f, %.3f]" % (core_x0, core_x1, core_y0, core_y1))
+for _clbl, _cx0, _cx1, _cy0, _cy1 in _CORES:
+    print("  core %s: x=[%.3f, %.3f]  y=[%.3f, %.3f]" % (_clbl, _cx0, _cx1, _cy0, _cy1))
 for bid, (bx0, bx1, by0, by1) in enumerate(bar_footprints):
     print("  Bar %d (%s): x=[%.3f, %.3f]  y=[%.3f, %.3f]  t=%.3f"
           % (bid, _orient[bid], bx0, bx1, by0, by1, _b_thick[bid]))
@@ -379,3 +472,9 @@ print("  Residential=%d/%d  Core=%d/%d  Floor=%d/%d  Ground=%d/%d  Columns=%d"
          len(Floor_Breps), exp_slab,
          len(Ground_Breps), exp_gnd,
          len(Column_Breps)))
+print("Circulation per floor:")
+for _fi in sorted(_circ_floor_stats):
+    _cors, _miss = _circ_floor_stats[_fi]
+    _miss_str = ("  MISSING bars=%s" % _miss) if _miss else ""
+    print("  Floor %d: corridors=%d/4%s" % (_fi, _cors, _miss_str))
+print("  Circulation_Breps total: %d" % len(Circulation_Breps))
